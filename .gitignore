@@ -17,3 +17,7 @@ wheels/
 *.pt
 debug*.csv
 result*.csv
+
+# Sample/source videos that are intentionally versioned.
+!source_videos/
+!source_videos/**

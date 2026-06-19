@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1350,6 +1351,42 @@ def should_drop_draw_item(
     )
 
 
+def format_duration(seconds: float) -> str:
+    if seconds < 0 or seconds == float("inf"):
+        return "--:--"
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def report_progress(
+    frame_index: int,
+    total_frames: int,
+    started_at: float,
+    force_newline: bool = False,
+) -> None:
+    elapsed = max(time.monotonic() - started_at, 1e-6)
+    processing_fps = frame_index / elapsed
+    if total_frames > 0:
+        percent = min(100.0, frame_index / total_frames * 100.0)
+        remaining_frames = max(total_frames - frame_index, 0)
+        eta = remaining_frames / processing_fps if processing_fps > 0 else float("inf")
+        message = (
+            f"\rProgress: {frame_index}/{total_frames} frames "
+            f"({percent:5.1f}%) | {processing_fps:5.1f} fps | ETA {format_duration(eta)}"
+        )
+    else:
+        message = f"\rProgress: {frame_index} frames | {processing_fps:5.1f} fps"
+
+    sys.stderr.write(message)
+    if force_newline:
+        sys.stderr.write("\n")
+    sys.stderr.flush()
+
+
 def run_realtime(args: argparse.Namespace) -> int:
     load_runtime_dependencies()
     cv2.setUseOptimized(True)
@@ -1408,6 +1445,11 @@ def run_realtime(args: argparse.Namespace) -> int:
     source_fps = capture.get(cv2.CAP_PROP_FPS)
     if source_fps <= 0 or source_fps > 240:
         source_fps = args.output_fps
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames < 0 or isinstance(source, str) and source.startswith("rtsp://"):
+        total_frames = 0
+    progress_started_at = time.monotonic()
+    progress_last_reported_at = 0.0
 
     try:
         while not stop:
@@ -1513,11 +1555,19 @@ def run_realtime(args: argparse.Namespace) -> int:
                 cv2.imshow(window_name, frame)
                 if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                     break
+            if args.progress:
+                progress_now = time.monotonic()
+                is_final_frame = total_frames > 0 and source_frame_index >= total_frames
+                if is_final_frame or progress_now - progress_last_reported_at >= args.progress_interval:
+                    report_progress(source_frame_index, total_frames, progress_started_at, is_final_frame)
+                    progress_last_reported_at = progress_now
     finally:
         capture.release()
         if writer is not None:
             writer.release()
         debug_logger.close()
+        if args.progress and (total_frames == 0 or source_frame_index < total_frames):
+            report_progress(source_frame_index, total_frames, progress_started_at, force_newline=True)
         if args.display:
             cv2.destroyAllWindows()
     return 0
@@ -1553,6 +1603,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-csv",
         default=None,
         help="Optional CSV path with per-frame detection, filtering, and matching diagnostics.",
+    )
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print processing progress to stderr; use --no-progress to disable it.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between terminal progress updates.",
     )
     parser.add_argument("--camera-id", default="cam-001", help="Stable logical camera identifier.")
     parser.add_argument(

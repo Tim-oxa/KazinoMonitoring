@@ -30,14 +30,14 @@ python main.py --source rtsp://user:password@host:554/stream --camera-id cam-001
 Local video file:
 
 ```bash
-python main.py --source /path/to/video.mp4 --camera-id file-001
+python main.py --source source_videos/video.mp4 --camera-id file-001
 ```
 
 Save annotated result to a file:
 
 ```bash
 python main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --camera-id test-video \
   --output result.mp4
 ```
@@ -46,7 +46,7 @@ Save annotated result without showing the realtime window:
 
 ```bash
 python main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --camera-id test-video \
   --output result.mp4 \
   --no-display
@@ -80,7 +80,7 @@ Stable ID preset with BoT-SORT:
 
 ```bash
 python main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --camera-id test-video \
   --output result.mp4 \
   --no-display \
@@ -98,7 +98,7 @@ TorchReID / OSNet body ReID:
 
 ```bash
 python main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --camera-id test-video \
   --output result_osnet.mp4 \
   --no-display \
@@ -123,7 +123,7 @@ Maximum quality preset:
 
 ```bash
 uv run main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --output result_max_quality.mp4 \
   --no-display \
   --debug-csv debug_max_quality.csv \
@@ -155,7 +155,7 @@ Fast Apple Silicon preset:
 
 ```bash
 python main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --camera-id test-video \
   --tracker trackers/casino_botsort.yaml \
   --yolo-device mps \
@@ -169,7 +169,7 @@ Higher accuracy Apple Silicon preset:
 
 ```bash
 python main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --camera-id test-video \
   --yolo-device mps \
   --yolo-imgsz 640 \
@@ -182,7 +182,7 @@ CPU-only fallback:
 
 ```bash
 python main.py \
-  --source video.mp4 \
+  --source source_videos/video.mp4 \
   --camera-id test-video \
   --yolo-device cpu \
   --yolo-imgsz 416 \
