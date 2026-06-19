@@ -177,6 +177,39 @@ uv run main.py \
 
 RF-DETR is currently integrated as a detector-only backend. It can provide stronger boxes and segmentation masks, but Ultralytics BoT-SORT track IDs are not used in this mode yet, so ID stability depends more heavily on body ReID, clothing, face, and memory matching.
 
+Persistent cloud memory with Qdrant:
+
+```bash
+export QDRANT_URL="https://YOUR_CLUSTER_URL"
+export QDRANT_API_KEY="YOUR_API_KEY"
+
+uv run main.py \
+  --source source_videos/video7.mp4 \
+  --output result_cloud_memory.mp4 \
+  --no-display \
+  --progress \
+  --cloud-memory qdrant \
+  --cloud-memory-sync-every-n-observations 5 \
+  --detector-backend yolo \
+  --tracker trackers/casino_botsort.yaml \
+  --yolo-model yolov8m-seg.pt \
+  --yolo-device cuda:0 \
+  --yolo-imgsz 1280 \
+  --body-reid-backend torchreid \
+  --body-reid-model osnet_x1_0 \
+  --body-reid-device cuda:0 \
+  --process-every-n-frames 1 \
+  --face-every-n-frames 3 \
+  --det-size 960x960 \
+  --person-confidence 0.18 \
+  --min-confirmed-hits 4 \
+  --match-threshold 0.64 \
+  --long-reentry-memory-seconds 600 \
+  --max-samples-per-person 60
+```
+
+Cloud memory stores confirmed Person ID embeddings in Qdrant collections for face, body, and clothing. On a new server, the app loads those profiles at startup and continues assigning IDs from the existing cloud memory.
+
 Fast Apple Silicon preset:
 
 ```bash

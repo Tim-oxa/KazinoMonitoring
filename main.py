@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import signal
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Iterable
@@ -213,6 +215,15 @@ class PersonMemory:
     @property
     def profiles(self) -> Iterable[PersonProfile]:
         return self._profiles.values()
+
+    def add_loaded_profiles(self, profiles: Iterable[PersonProfile]) -> None:
+        max_numeric_id = 0
+        for profile in profiles:
+            self._profiles[profile.person_id] = profile
+            numeric_part = profile.person_id.removeprefix("P-")
+            if numeric_part.isdigit():
+                max_numeric_id = max(max_numeric_id, int(numeric_part))
+        self._next_id = max(self._next_id, max_numeric_id + 1)
 
     def match_or_create(
         self,
@@ -443,6 +454,224 @@ class PersonMemory:
 
     def _track_key(self, observation: PersonObservation) -> str:
         return f"{observation.camera_id}:{observation.track_id}"
+
+
+class CloudPersonMemoryStore:
+    COLLECTIONS = {
+        "face": "casino_person_faces",
+        "body": "casino_person_bodies",
+        "clothing": "casino_person_clothing",
+    }
+
+    def __init__(
+        self,
+        provider: str,
+        qdrant_url: str | None,
+        qdrant_api_key: str | None,
+        sync_every_n_observations: int,
+    ) -> None:
+        self.provider = provider
+        self.sync_every_n_observations = max(1, sync_every_n_observations)
+        self._client = None
+        self._warned_upsert_failure = False
+
+        if provider == "off":
+            return
+        if provider != "qdrant":
+            raise RuntimeError(f"Unsupported cloud memory provider: {provider}")
+
+        qdrant_url = qdrant_url or os.getenv("QDRANT_URL")
+        qdrant_api_key = qdrant_api_key or os.getenv("QDRANT_API_KEY")
+        if not qdrant_url:
+            raise RuntimeError("Qdrant cloud memory requires --qdrant-url or QDRANT_URL.")
+
+        try:
+            from qdrant_client import QdrantClient
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("Qdrant cloud memory requires qdrant-client. Install with: uv add qdrant-client") from exc
+
+        self._client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+
+    @property
+    def enabled(self) -> bool:
+        return self._client is not None
+
+    def load_profiles(self, max_samples_per_person: int) -> list[PersonProfile]:
+        if self._client is None:
+            return []
+
+        profiles: dict[str, PersonProfile] = {}
+        for modality, collection_name in self.COLLECTIONS.items():
+            if not self._collection_exists(collection_name):
+                continue
+            next_page = None
+            while True:
+                points, next_page = self._client.scroll(
+                    collection_name=collection_name,
+                    limit=256,
+                    offset=next_page,
+                    with_payload=True,
+                    with_vectors=True,
+                )
+                for point in points:
+                    self._load_point(profiles, modality, point, max_samples_per_person)
+                if next_page is None:
+                    break
+
+        return list(profiles.values())
+
+    def upsert_observation(
+        self,
+        profile: PersonProfile,
+        observation: PersonObservation,
+        store_visual_sample: bool,
+    ) -> None:
+        if self._client is None or profile.status != "confirmed":
+            return
+        if profile.observations % self.sync_every_n_observations != 0 and observation.face_quality < 0.55:
+            return
+
+        try:
+            if observation.face_embedding is not None and observation.face_quality >= 0.35:
+                self._upsert_vector(
+                    modality="face",
+                    person_id=profile.person_id,
+                    vector=observation.face_embedding,
+                    quality=observation.face_quality,
+                    observation=observation,
+                    profile=profile,
+                )
+
+            if store_visual_sample:
+                self._upsert_vector(
+                    modality="body",
+                    person_id=profile.person_id,
+                    vector=observation.body_embedding,
+                    quality=observation.visual_quality,
+                    observation=observation,
+                    profile=profile,
+                )
+                self._upsert_vector(
+                    modality="clothing",
+                    person_id=profile.person_id,
+                    vector=observation.clothing_features,
+                    quality=observation.visual_quality,
+                    observation=observation,
+                    profile=profile,
+                )
+        except Exception as exc:
+            if not self._warned_upsert_failure:
+                print(f"Cloud memory warning: failed to upsert observation: {exc}", file=sys.stderr)
+                self._warned_upsert_failure = True
+
+    def _load_point(
+        self,
+        profiles: dict[str, PersonProfile],
+        modality: str,
+        point: object,
+        max_samples_per_person: int,
+    ) -> None:
+        payload = getattr(point, "payload", None) or {}
+        person_id = payload.get("person_id")
+        vector = getattr(point, "vector", None)
+        if not person_id or vector is None:
+            return
+
+        profile = profiles.get(person_id)
+        if profile is None:
+            profile = PersonProfile(person_id=person_id, status=str(payload.get("status", "confirmed")))
+            profiles[person_id] = profile
+
+        vector_np = normalize_vector(np.asarray(vector, dtype=np.float32))
+        quality = float(payload.get("quality", 0.5))
+
+        if modality == "face":
+            profile.face_embeddings.append(vector_np)
+            profile.face_embeddings = profile.face_embeddings[-max_samples_per_person:]
+        elif modality == "body":
+            add_quality_sample(
+                profile.body_embeddings,
+                profile.body_embedding_qualities,
+                vector_np,
+                quality,
+                max_samples_per_person,
+            )
+        elif modality == "clothing":
+            add_quality_sample(
+                profile.clothing_features,
+                profile.clothing_feature_qualities,
+                vector_np,
+                quality,
+                max_samples_per_person,
+            )
+
+        camera_id = payload.get("camera_id")
+        if camera_id:
+            profile.cameras.add(str(camera_id))
+        profile.observations = max(profile.observations, int(payload.get("observations", 0)))
+        profile.first_seen = min(profile.first_seen, parse_datetime_payload(payload.get("first_seen")))
+        profile.last_seen = max(profile.last_seen, parse_datetime_payload(payload.get("last_seen")))
+
+    def _upsert_vector(
+        self,
+        modality: str,
+        person_id: str,
+        vector: "np.ndarray",
+        quality: float,
+        observation: PersonObservation,
+        profile: PersonProfile,
+    ) -> None:
+        collection_name = self.COLLECTIONS[modality]
+        vector_list = np.asarray(vector, dtype=np.float32).tolist()
+        self._ensure_collection(collection_name, len(vector_list))
+
+        from qdrant_client.models import PointStruct
+
+        payload = {
+            "person_id": person_id,
+            "modality": modality,
+            "quality": float(quality),
+            "camera_id": observation.camera_id,
+            "status": profile.status,
+            "observations": profile.observations,
+            "first_seen": profile.first_seen.isoformat(),
+            "last_seen": profile.last_seen.isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._client.upsert(
+            collection_name=collection_name,
+            points=[PointStruct(id=str(uuid.uuid4()), vector=vector_list, payload=payload)],
+            wait=False,
+        )
+
+    def _ensure_collection(self, collection_name: str, vector_size: int) -> None:
+        if self._collection_exists(collection_name):
+            return
+
+        from qdrant_client.models import Distance, VectorParams
+
+        self._client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
+
+    def _collection_exists(self, collection_name: str) -> bool:
+        try:
+            return bool(self._client.collection_exists(collection_name))
+        except Exception:
+            return False
+
+
+def parse_datetime_payload(value: object) -> datetime:
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc)
 
 
 def load_runtime_dependencies() -> None:
@@ -1656,6 +1885,12 @@ def run_realtime(args: argparse.Namespace) -> int:
         device=args.body_reid_device,
     )
     debug_logger = DebugLogger(args.debug_csv)
+    cloud_memory = CloudPersonMemoryStore(
+        provider=args.cloud_memory,
+        qdrant_url=args.qdrant_url,
+        qdrant_api_key=args.qdrant_api_key,
+        sync_every_n_observations=args.cloud_memory_sync_every_n_observations,
+    )
     memory = PersonMemory(
         match_threshold=args.match_threshold,
         max_samples_per_person=args.max_samples_per_person,
@@ -1678,6 +1913,10 @@ def run_realtime(args: argparse.Namespace) -> int:
         min_visual_sample_confidence=args.min_visual_sample_confidence,
         min_confirmed_hits=args.min_confirmed_hits,
     )
+    if cloud_memory.enabled:
+        loaded_profiles = cloud_memory.load_profiles(args.max_samples_per_person)
+        memory.add_loaded_profiles(loaded_profiles)
+        print(f"Cloud memory: loaded {len(loaded_profiles)} person profiles.", file=sys.stderr)
 
     capture = open_capture(source)
     if not capture.isOpened():
@@ -1765,6 +2004,8 @@ def run_realtime(args: argparse.Namespace) -> int:
                 assigned_person_ids: set[str] = set()
                 for observation in observations:
                     profile, breakdown, is_new = memory.match_or_create(observation, assigned_person_ids)
+                    store_visual_sample = memory._should_store_visual_sample(observation)
+                    cloud_memory.upsert_observation(profile, observation, store_visual_sample)
                     assigned_person_ids.add(profile.person_id)
                     live_person_ids.add(profile.person_id)
                     live_bboxes.append(observation.bbox)
@@ -1861,6 +2102,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug-csv",
         default=None,
         help="Optional CSV path with per-frame detection, filtering, and matching diagnostics.",
+    )
+    parser.add_argument(
+        "--cloud-memory",
+        choices=["off", "qdrant"],
+        default="off",
+        help="Persistent cloud memory backend for loading/saving Person IDs across server rebuilds.",
+    )
+    parser.add_argument(
+        "--qdrant-url",
+        default=None,
+        help="Qdrant Cloud URL. Can also be set with QDRANT_URL.",
+    )
+    parser.add_argument(
+        "--qdrant-api-key",
+        default=None,
+        help="Qdrant Cloud API key. Prefer QDRANT_API_KEY env var instead of passing it in shell history.",
+    )
+    parser.add_argument(
+        "--cloud-memory-sync-every-n-observations",
+        type=positive_int,
+        default=5,
+        help="Persist confirmed person embeddings every N observations to reduce cloud writes.",
     )
     parser.add_argument(
         "--progress",
