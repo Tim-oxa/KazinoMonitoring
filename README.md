@@ -151,6 +151,32 @@ uv run main.py \
 
 For this preset, use a segmentation model (`*-seg.pt`). When masks are available, body/clothing features and OSNet crops are extracted from the person mask instead of the full bbox, which improves quality during crossings and partial occlusions.
 
+Experimental RF-DETR preset:
+
+```bash
+uv run main.py \
+  --source source_videos/video.mp4 \
+  --output result_rfdetr.mp4 \
+  --no-display \
+  --progress \
+  --detector-backend rfdetr \
+  --rfdetr-model-size medium \
+  --rfdetr-segmentation \
+  --person-confidence 0.30 \
+  --body-reid-backend torchreid \
+  --body-reid-model osnet_x1_0 \
+  --body-reid-device auto \
+  --process-every-n-frames 1 \
+  --face-every-n-frames 3 \
+  --det-size 960x960 \
+  --min-confirmed-hits 4 \
+  --match-threshold 0.64 \
+  --long-reentry-memory-seconds 600 \
+  --max-samples-per-person 60
+```
+
+RF-DETR is currently integrated as a detector-only backend. It can provide stronger boxes and segmentation masks, but Ultralytics BoT-SORT track IDs are not used in this mode yet, so ID stability depends more heavily on body ReID, clothing, face, and memory matching.
+
 Fast Apple Silicon preset:
 
 ```bash

@@ -16,6 +16,23 @@ if TYPE_CHECKING:
     from ultralytics import YOLO
 
 
+RFDETR_DETECTOR_CLASSES = {
+    "nano": "RFDETRNano",
+    "small": "RFDETRSmall",
+    "medium": "RFDETRMedium",
+    "large": "RFDETRLarge",
+}
+
+RFDETR_SEGMENTATION_CLASSES = {
+    "nano": "RFDETRSegNano",
+    "small": "RFDETRSegSmall",
+    "medium": "RFDETRSegMedium",
+    "large": "RFDETRSegLarge",
+    "xlarge": "RFDETRSegXLarge",
+    "2xlarge": "RFDETRSeg2XLarge",
+}
+
+
 DEFAULT_MATCH_THRESHOLD = 0.52
 DEFAULT_MIN_FACE_SCORE = 0.50
 DEFAULT_MAX_SAMPLES_PER_PERSON = 20
@@ -51,6 +68,7 @@ class FilteredDetection:
 class PersonObservation:
     camera_id: str
     bbox: tuple[int, int, int, int]
+    frame_shape: tuple[int, int, int]
     body_embedding: "np.ndarray"
     clothing_features: "np.ndarray"
     body_proportions: "np.ndarray"
@@ -157,6 +175,14 @@ class PersonMemory:
         continuity_threshold: float = 0.78,
         track_memory_seconds: float = 30.0,
         new_track_match_threshold: float = 0.72,
+        reentry_memory_seconds: float = 2.5,
+        reentry_match_threshold: float = 0.58,
+        reentry_position_threshold: float = 0.20,
+        reentry_min_appearance_score: float = 0.55,
+        long_reentry_memory_seconds: float = 600.0,
+        long_reentry_match_threshold: float = 0.66,
+        long_reentry_body_threshold: float = 0.62,
+        long_reentry_clothing_threshold: float = 0.56,
         min_visual_sample_confidence: float = 0.55,
         min_confirmed_hits: int = 3,
     ) -> None:
@@ -170,6 +196,14 @@ class PersonMemory:
         self.continuity_threshold = continuity_threshold
         self.track_memory_seconds = track_memory_seconds
         self.new_track_match_threshold = new_track_match_threshold
+        self.reentry_memory_seconds = reentry_memory_seconds
+        self.reentry_match_threshold = reentry_match_threshold
+        self.reentry_position_threshold = reentry_position_threshold
+        self.reentry_min_appearance_score = reentry_min_appearance_score
+        self.long_reentry_memory_seconds = long_reentry_memory_seconds
+        self.long_reentry_match_threshold = long_reentry_match_threshold
+        self.long_reentry_body_threshold = long_reentry_body_threshold
+        self.long_reentry_clothing_threshold = long_reentry_clothing_threshold
         self.min_visual_sample_confidence = min_visual_sample_confidence
         self.min_confirmed_hits = min_confirmed_hits
         self._profiles: dict[str, PersonProfile] = {}
@@ -203,7 +237,7 @@ class PersonMemory:
 
         profile, breakdown = self._best_match(observation, excluded_person_ids)
 
-        if profile is not None and self._should_accept_match(observation, breakdown):
+        if profile is not None and self._should_accept_match(observation, profile, breakdown):
             profile.update(
                 observation,
                 self.max_samples_per_person,
@@ -287,10 +321,19 @@ class PersonMemory:
             threshold += 0.04
         return threshold
 
-    def _should_accept_match(self, observation: PersonObservation, breakdown: MatchBreakdown) -> bool:
+    def _should_accept_match(
+        self,
+        observation: PersonObservation,
+        profile: PersonProfile,
+        breakdown: MatchBreakdown,
+    ) -> bool:
         if breakdown.face_score is not None and breakdown.face_score >= self.strong_face_threshold:
             return True
         if self._is_continuity_match(breakdown):
+            return True
+        if self._is_short_reentry_match(observation, profile, breakdown):
+            return True
+        if self._is_long_reentry_match(observation, profile, breakdown):
             return True
         if observation.track_id is not None:
             return breakdown.final_score >= self.new_track_match_threshold
@@ -307,6 +350,70 @@ class PersonMemory:
 
     def _is_continuity_match(self, breakdown: MatchBreakdown) -> bool:
         return breakdown.position_score is not None and breakdown.position_score >= self.continuity_threshold
+
+    def _is_short_reentry_match(
+        self,
+        observation: PersonObservation,
+        profile: PersonProfile,
+        breakdown: MatchBreakdown,
+    ) -> bool:
+        last_bbox_item = last_camera_bbox_item(profile, observation.camera_id)
+        if last_bbox_item is None:
+            return False
+
+        last_bbox, last_ts = last_bbox_item
+        dt = max(0.0, observation.timestamp - last_ts)
+        if dt > self.reentry_memory_seconds:
+            return False
+        if breakdown.final_score < self.reentry_match_threshold:
+            return False
+
+        appearance_score = best_available_score(
+            breakdown.face_score,
+            breakdown.body_score,
+            breakdown.clothing_score,
+        )
+        if appearance_score < self.reentry_min_appearance_score:
+            return False
+
+        position_ok = (
+            breakdown.position_score is not None
+            and breakdown.position_score >= self.reentry_position_threshold
+        )
+        edge_ok = (
+            bbox_touches_frame_edge(last_bbox, observation.frame_shape)
+            or bbox_touches_frame_edge(observation.bbox, observation.frame_shape)
+        )
+        return position_ok or edge_ok
+
+    def _is_long_reentry_match(
+        self,
+        observation: PersonObservation,
+        profile: PersonProfile,
+        breakdown: MatchBreakdown,
+    ) -> bool:
+        if profile.status != "confirmed":
+            return False
+        if self.long_reentry_memory_seconds <= 0:
+            return False
+
+        last_seen_ts = last_camera_seen_timestamp(profile, observation.camera_id)
+        if last_seen_ts is None:
+            return False
+
+        dt = max(0.0, observation.timestamp - last_seen_ts)
+        if dt <= self.reentry_memory_seconds or dt > self.long_reentry_memory_seconds:
+            return False
+        if breakdown.final_score < self.long_reentry_match_threshold:
+            return False
+        if breakdown.face_score is not None and breakdown.face_score >= self.strong_face_threshold:
+            return True
+        return (
+            breakdown.body_score is not None
+            and breakdown.body_score >= self.long_reentry_body_threshold
+            and breakdown.clothing_score is not None
+            and breakdown.clothing_score >= self.long_reentry_clothing_threshold
+        )
 
     def _profile_for_track(
         self,
@@ -427,6 +534,13 @@ def empty_breakdown() -> MatchBreakdown:
         location_time_score=None,
         weights=BASE_WEIGHTS.copy(),
     )
+
+
+def best_available_score(*scores: float | None) -> float:
+    available_scores = [score for score in scores if score is not None]
+    if not available_scores:
+        return -1.0
+    return max(available_scores)
 
 
 def adaptive_weights(observation: PersonObservation) -> dict[str, float]:
@@ -589,6 +703,37 @@ def build_face_app(det_size: tuple[int, int], providers: list[str]) -> "FaceAnal
 
 def build_person_detector(model_name: str) -> "YOLO":
     return YOLO(model_name)
+
+
+class RFDETRPersonDetector:
+    def __init__(self, model_size: str, segmentation: bool) -> None:
+        class_map = RFDETR_SEGMENTATION_CLASSES if segmentation else RFDETR_DETECTOR_CLASSES
+        model_class_name = class_map.get(model_size)
+        if model_class_name is None:
+            available = ", ".join(sorted(class_map))
+            raise RuntimeError(f"Unsupported RF-DETR model size '{model_size}'. Available sizes: {available}.")
+
+        try:
+            import rfdetr
+            from rfdetr.assets.coco_classes import COCO_CLASSES
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "RF-DETR backend requires the 'rfdetr' package. Install it with: uv add rfdetr"
+            ) from exc
+
+        model_class = getattr(rfdetr, model_class_name, None)
+        if model_class is None:
+            raise RuntimeError(f"Installed rfdetr package does not expose {model_class_name}.")
+
+        self.model = model_class()
+        class_items = COCO_CLASSES.items() if hasattr(COCO_CLASSES, "items") else enumerate(COCO_CLASSES)
+        self.person_class_ids = {
+            int(class_id)
+            for class_id, class_name in class_items
+            if str(class_name).lower() == "person"
+        }
+        if not self.person_class_ids:
+            self.person_class_ids = {0, 1}
 
 
 class BodyReIDExtractor:
@@ -856,6 +1001,18 @@ def bbox_min_overlap(first: tuple[int, int, int, int], second: tuple[int, int, i
     return float(intersection / min_area)
 
 
+def bbox_touches_frame_edge(
+    bbox: tuple[int, int, int, int],
+    frame_shape: tuple[int, int, int],
+    margin_ratio: float = 0.06,
+) -> bool:
+    frame_h, frame_w = frame_shape[:2]
+    x1, y1, x2, y2 = bbox
+    margin_x = frame_w * margin_ratio
+    margin_y = frame_h * margin_ratio
+    return x1 <= margin_x or y1 <= margin_y or x2 >= frame_w - margin_x or y2 >= frame_h - margin_y
+
+
 def last_camera_bbox(profile: PersonProfile, camera_id: str) -> tuple[int, int, int, int] | None:
     for bbox_camera_id, bbox, _timestamp in reversed(profile.bbox_history):
         if bbox_camera_id == camera_id:
@@ -867,6 +1024,13 @@ def last_camera_bbox_item(profile: PersonProfile, camera_id: str) -> tuple[tuple
     for bbox_camera_id, bbox, timestamp in reversed(profile.bbox_history):
         if bbox_camera_id == camera_id:
             return bbox, timestamp
+    return None
+
+
+def last_camera_seen_timestamp(profile: PersonProfile, camera_id: str) -> float | None:
+    for history_camera_id, _center, timestamp in reversed(profile.movement_history):
+        if history_camera_id == camera_id:
+            return timestamp
     return None
 
 
@@ -1175,6 +1339,66 @@ def track_people(
     return people
 
 
+def detect_people_rfdetr(
+    detector: RFDETRPersonDetector,
+    frame: "np.ndarray",
+    confidence: float,
+    max_people: int,
+) -> list[PersonDetection]:
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    detections = detector.model.predict(rgb_frame, threshold=confidence)
+    xyxy = np.asarray(getattr(detections, "xyxy", []), dtype=np.float32)
+    if xyxy.size == 0:
+        return []
+
+    scores = np.asarray(getattr(detections, "confidence", np.ones(len(xyxy))), dtype=np.float32)
+    class_ids = getattr(detections, "class_id", None)
+    if class_ids is None:
+        class_ids = np.zeros(len(xyxy), dtype=np.int32)
+    class_ids = np.asarray(class_ids, dtype=np.int32)
+
+    masks = getattr(detections, "mask", None)
+    if masks is not None:
+        masks = np.asarray(masks)
+
+    candidates: list[tuple["np.ndarray", float, "np.ndarray | None"]] = []
+    for index, (box, score, class_id) in enumerate(zip(xyxy, scores, class_ids, strict=False)):
+        if int(class_id) not in detector.person_class_ids:
+            continue
+        if float(score) < confidence:
+            continue
+        mask = None
+        if masks is not None and index < len(masks):
+            mask = normalize_detection_mask(masks[index], frame.shape)
+        candidates.append((box, float(score), mask))
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    people: list[PersonDetection] = []
+    for box, score, mask in candidates:
+        bbox = clip_bbox(tuple(box.astype(np.int32).tolist()), frame.shape)
+        x1, y1, x2, y2 = bbox
+        if x2 - x1 < 20 or y2 - y1 < 40:
+            continue
+        people.append(PersonDetection(bbox=bbox, score=score, mask=mask))
+        if max_people > 0 and len(people) >= max_people:
+            break
+    return people
+
+
+def normalize_detection_mask(mask: "np.ndarray", frame_shape: tuple[int, int, int]) -> "np.ndarray | None":
+    frame_h, frame_w = frame_shape[:2]
+    if mask.size == 0:
+        return None
+    normalized = mask > 0.5
+    if normalized.shape != (frame_h, frame_w):
+        normalized = cv2.resize(
+            normalized.astype(np.uint8),
+            (frame_w, frame_h),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+    return normalized
+
+
 def result_masks(result: object, frame_shape: tuple[int, int, int], count: int) -> list["np.ndarray | None"]:
     masks_obj = getattr(result, "masks", None)
     if masks_obj is None or getattr(masks_obj, "data", None) is None:
@@ -1276,6 +1500,7 @@ def build_observations(
             PersonObservation(
                 camera_id=camera_id,
                 bbox=person_bbox,
+                frame_shape=frame.shape,
                 body_embedding=body_reid.extract(frame, person_bbox, detection.mask),
                 clothing_features=extract_clothing_features(frame, person_bbox, detection.mask),
                 body_proportions=extract_body_proportions(person_bbox, frame.shape),
@@ -1302,26 +1527,41 @@ def draw_person(
     is_new: bool,
 ) -> None:
     x1, y1, x2, y2 = observation.bbox
-    color = (60, 220, 80) if not is_new else (40, 170, 255)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    color = (65, 205, 245) if not is_new else (55, 175, 255)
+    fill_alpha = 0.18 if not is_new else 0.22
+    border_alpha = 0.72
 
-    if observation.face_bbox is not None:
-        fx1, fy1, fx2, fy2 = observation.face_bbox
-        cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (220, 220, 60), 1)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, fill_alpha, frame, 1.0 - fill_alpha, 0, frame)
 
-    label = person_id
-    label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    border_layer = frame.copy()
+    cv2.rectangle(border_layer, (x1, y1), (x2, y2), color, 2)
+    cv2.addWeighted(border_layer, border_alpha, frame, 1.0 - border_alpha, 0, frame)
+
+    label = person_id.removeprefix("P-")
+    label_scale = 0.56
+    label_thickness = 2
+    label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, label_scale, label_thickness)
     label_w, label_h = label_size
-    y_top = max(0, y1 - label_h - baseline - 6)
-    cv2.rectangle(frame, (x1, y_top), (x1 + label_w + 8, y_top + label_h + baseline + 6), color, -1)
+    pad_x = 8
+    pad_y = 5
+    label_x1 = x1
+    label_y1 = max(0, y1 - label_h - baseline - pad_y * 2)
+    label_x2 = min(frame.shape[1] - 1, label_x1 + label_w + pad_x * 2)
+    label_y2 = min(frame.shape[0] - 1, label_y1 + label_h + baseline + pad_y * 2)
+
+    label_layer = frame.copy()
+    cv2.rectangle(label_layer, (label_x1, label_y1), (label_x2, label_y2), color, -1)
+    cv2.addWeighted(label_layer, 0.72, frame, 0.28, 0, frame)
     cv2.putText(
         frame,
         label,
-        (x1 + 4, y_top + label_h + 1),
+        (label_x1 + pad_x, label_y1 + pad_y + label_h),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (10, 10, 10),
-        2,
+        label_scale,
+        (255, 245, 210),
+        label_thickness,
         cv2.LINE_AA,
     )
 
@@ -1406,7 +1646,10 @@ def run_realtime(args: argparse.Namespace) -> int:
 
     source = parse_source(args.source)
     face_app = build_face_app(args.det_size, args.providers)
-    person_detector = build_person_detector(args.yolo_model)
+    if args.detector_backend == "rfdetr":
+        person_detector = RFDETRPersonDetector(args.rfdetr_model_size, args.rfdetr_segmentation)
+    else:
+        person_detector = build_person_detector(args.yolo_model)
     body_reid = BodyReIDExtractor(
         backend=args.body_reid_backend,
         model_name=args.body_reid_model,
@@ -1424,6 +1667,14 @@ def run_realtime(args: argparse.Namespace) -> int:
         continuity_threshold=args.continuity_threshold,
         track_memory_seconds=args.track_memory_seconds,
         new_track_match_threshold=args.new_track_match_threshold,
+        reentry_memory_seconds=args.reentry_memory_seconds,
+        reentry_match_threshold=args.reentry_match_threshold,
+        reentry_position_threshold=args.reentry_position_threshold,
+        reentry_min_appearance_score=args.reentry_min_appearance_score,
+        long_reentry_memory_seconds=args.long_reentry_memory_seconds,
+        long_reentry_match_threshold=args.long_reentry_match_threshold,
+        long_reentry_body_threshold=args.long_reentry_body_threshold,
+        long_reentry_clothing_threshold=args.long_reentry_clothing_threshold,
         min_visual_sample_confidence=args.min_visual_sample_confidence,
         min_confirmed_hits=args.min_confirmed_hits,
     )
@@ -1469,7 +1720,14 @@ def run_realtime(args: argparse.Namespace) -> int:
             live_bboxes: list[tuple[int, int, int, int]] = []
             live_person_ids: set[str] = set()
             if should_process:
-                if args.tracker == "off":
+                if args.detector_backend == "rfdetr":
+                    people = detect_people_rfdetr(
+                        person_detector,
+                        frame,
+                        args.person_confidence,
+                        args.max_people,
+                    )
+                elif args.tracker == "off":
                     people = detect_people(
                         person_detector,
                         frame,
@@ -1618,6 +1876,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-id", default="cam-001", help="Stable logical camera identifier.")
     parser.add_argument(
+        "--detector-backend",
+        choices=["yolo", "rfdetr"],
+        default="yolo",
+        help="Person detector backend. RF-DETR is experimental and currently runs without Ultralytics tracking IDs.",
+    )
+    parser.add_argument(
         "--yolo-model",
         default="yolov8n.pt",
         help="Ultralytics YOLO model for person detection.",
@@ -1634,10 +1898,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ultralytics device, for example mps on Apple Silicon, cpu, or cuda:0.",
     )
     parser.add_argument(
+        "--rfdetr-model-size",
+        choices=["nano", "small", "medium", "large", "xlarge", "2xlarge"],
+        default="medium",
+        help="RF-DETR model size. Detection supports nano/small/medium/large; segmentation also supports xlarge/2xlarge.",
+    )
+    parser.add_argument(
+        "--rfdetr-segmentation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use RF-DETR segmentation models and pass masks into ReID/clothing extraction.",
+    )
+    parser.add_argument(
         "--person-confidence",
         type=float,
         default=0.25,
-        help="Minimum YOLO confidence for person detections.",
+        help="Minimum detector confidence for person detections.",
     )
     parser.add_argument(
         "--tracker",
@@ -1785,6 +2061,54 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.72,
         help="Stricter score required before assigning a new tracker ID to an existing Person ID.",
+    )
+    parser.add_argument(
+        "--reentry-memory-seconds",
+        type=float,
+        default=2.5,
+        help="Seconds after a disappearance where a nearby/edge re-entry can reuse an existing Person ID.",
+    )
+    parser.add_argument(
+        "--reentry-match-threshold",
+        type=float,
+        default=0.58,
+        help="Lower match score accepted for short same-camera re-entry after a missed track.",
+    )
+    parser.add_argument(
+        "--reentry-position-threshold",
+        type=float,
+        default=0.20,
+        help="Minimum position continuity score for short re-entry matching.",
+    )
+    parser.add_argument(
+        "--reentry-min-appearance-score",
+        type=float,
+        default=0.55,
+        help="Minimum face/body/clothing score required for short re-entry matching.",
+    )
+    parser.add_argument(
+        "--long-reentry-memory-seconds",
+        type=float,
+        default=600.0,
+        help="Seconds to keep confirmed same-camera profiles eligible for later appearance-based re-entry.",
+    )
+    parser.add_argument(
+        "--long-reentry-match-threshold",
+        type=float,
+        default=0.66,
+        help="Minimum final score for matching a confirmed profile after a longer disappearance.",
+    )
+    parser.add_argument(
+        "--long-reentry-body-threshold",
+        type=float,
+        default=0.62,
+        help="Minimum body ReID score for matching a confirmed profile after a longer disappearance.",
+    )
+    parser.add_argument(
+        "--long-reentry-clothing-threshold",
+        type=float,
+        default=0.56,
+        help="Minimum clothing score for matching a confirmed profile after a longer disappearance.",
     )
     parser.add_argument(
         "--min-confirmed-hits",
