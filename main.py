@@ -92,6 +92,9 @@ class DrawItem:
     breakdown: "MatchBreakdown"
     is_new: bool
     last_seen_frame: int
+    draw_bbox: tuple[int, int, int, int]
+    is_live: bool = True
+    trail: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -1193,6 +1196,24 @@ def bbox_center(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
 
+def bbox_int_center(bbox: tuple[int, int, int, int]) -> tuple[int, int]:
+    center_x, center_y = bbox_center(bbox)
+    return int(round(center_x)), int(round(center_y))
+
+
+def smooth_bbox(
+    previous: tuple[int, int, int, int] | None,
+    current: tuple[int, int, int, int],
+    alpha: float = 0.35,
+) -> tuple[int, int, int, int]:
+    if previous is None:
+        return current
+    return tuple(
+        int(round(previous_value * (1.0 - alpha) + current_value * alpha))
+        for previous_value, current_value in zip(previous, current, strict=True)
+    )
+
+
 def bbox_diagonal(bbox: tuple[int, int, int, int]) -> float:
     x1, y1, x2, y2 = bbox
     return float(np.hypot(max(0, x2 - x1), max(0, y2 - y1)))
@@ -1750,25 +1771,30 @@ def build_observations(
 
 def draw_person(
     frame: "np.ndarray",
-    observation: PersonObservation,
-    person_id: str,
-    breakdown: MatchBreakdown,
-    is_new: bool,
+    item: DrawItem,
 ) -> None:
-    x1, y1, x2, y2 = observation.bbox
-    color = (65, 205, 245) if not is_new else (55, 175, 255)
-    fill_alpha = 0.18 if not is_new else 0.22
-    border_alpha = 0.72
+    x1, y1, x2, y2 = item.draw_bbox
+    color = person_color(item.person_id)
+    fill_alpha = 0.16 if item.is_live else 0.06
+    if item.is_new:
+        fill_alpha = 0.22
+    border_alpha = 0.72 if item.is_live else 0.42
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
-    cv2.addWeighted(overlay, fill_alpha, frame, 1.0 - fill_alpha, 0, frame)
+    draw_trail(frame, item.trail, color)
+
+    if item.is_live:
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+        cv2.addWeighted(overlay, fill_alpha, frame, 1.0 - fill_alpha, 0, frame)
 
     border_layer = frame.copy()
-    cv2.rectangle(border_layer, (x1, y1), (x2, y2), color, 2)
+    if item.is_live:
+        cv2.rectangle(border_layer, (x1, y1), (x2, y2), color, 2)
+    else:
+        draw_dashed_rectangle(border_layer, (x1, y1), (x2, y2), color, 2)
     cv2.addWeighted(border_layer, border_alpha, frame, 1.0 - border_alpha, 0, frame)
 
-    label = person_id.removeprefix("P-")
+    label = item.person_id.removeprefix("P-")
     label_scale = 0.56
     label_thickness = 2
     label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, label_scale, label_thickness)
@@ -1782,7 +1808,7 @@ def draw_person(
 
     label_layer = frame.copy()
     cv2.rectangle(label_layer, (label_x1, label_y1), (label_x2, label_y2), color, -1)
-    cv2.addWeighted(label_layer, 0.72, frame, 0.28, 0, frame)
+    cv2.addWeighted(label_layer, 0.72 if item.is_live else 0.48, frame, 0.28 if item.is_live else 0.52, 0, frame)
     cv2.putText(
         frame,
         label,
@@ -1793,6 +1819,112 @@ def draw_person(
         label_thickness,
         cv2.LINE_AA,
     )
+
+
+def draw_dashed_rectangle(
+    frame: "np.ndarray",
+    pt1: tuple[int, int],
+    pt2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int,
+    dash_length: int = 12,
+    gap_length: int = 8,
+) -> None:
+    x1, y1 = pt1
+    x2, y2 = pt2
+    draw_dashed_line(frame, (x1, y1), (x2, y1), color, thickness, dash_length, gap_length)
+    draw_dashed_line(frame, (x2, y1), (x2, y2), color, thickness, dash_length, gap_length)
+    draw_dashed_line(frame, (x2, y2), (x1, y2), color, thickness, dash_length, gap_length)
+    draw_dashed_line(frame, (x1, y2), (x1, y1), color, thickness, dash_length, gap_length)
+
+
+def draw_dashed_line(
+    frame: "np.ndarray",
+    pt1: tuple[int, int],
+    pt2: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int,
+    dash_length: int,
+    gap_length: int,
+) -> None:
+    x1, y1 = pt1
+    x2, y2 = pt2
+    length = int(np.hypot(x2 - x1, y2 - y1))
+    if length <= 0:
+        return
+    direction = ((x2 - x1) / length, (y2 - y1) / length)
+    step = dash_length + gap_length
+    for start in range(0, length, step):
+        end = min(start + dash_length, length)
+        dash_start = (int(round(x1 + direction[0] * start)), int(round(y1 + direction[1] * start)))
+        dash_end = (int(round(x1 + direction[0] * end)), int(round(y1 + direction[1] * end)))
+        cv2.line(frame, dash_start, dash_end, color, thickness, cv2.LINE_AA)
+
+
+def person_color(person_id: str) -> tuple[int, int, int]:
+    palette = [
+        (65, 205, 245),
+        (90, 220, 120),
+        (245, 170, 80),
+        (210, 140, 255),
+        (90, 190, 255),
+        (180, 225, 80),
+        (255, 120, 160),
+        (120, 220, 220),
+    ]
+    color_index = sum(ord(char) for char in person_id) % len(palette)
+    return palette[color_index]
+
+
+def draw_trail(frame: "np.ndarray", trail: list[tuple[int, int]], color: tuple[int, int, int]) -> None:
+    if len(trail) < 2:
+        return
+    trail_layer = frame.copy()
+    for index in range(1, len(trail)):
+        alpha = index / max(1, len(trail) - 1)
+        point_color = tuple(int(channel * (0.55 + 0.35 * alpha)) for channel in color)
+        cv2.line(trail_layer, trail[index - 1], trail[index], point_color, 1, cv2.LINE_AA)
+    cv2.addWeighted(trail_layer, 0.35, frame, 0.65, 0, frame)
+
+
+def draw_demo_hud(
+    frame: "np.ndarray",
+    camera_id: str,
+    live_count: int,
+    held_count: int,
+    memory_count: int,
+) -> None:
+    lines = [
+        f"Camera {camera_id}",
+        f"Live {live_count}",
+        f"Memory {memory_count}",
+    ]
+    if held_count > 0:
+        lines.append(f"Held {held_count}")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.52
+    thickness = 1
+    padding_x = 12
+    padding_y = 10
+    line_gap = 7
+    text_sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
+    box_w = max(width for width, _height in text_sizes) + padding_x * 2
+    line_h = max(height for _width, height in text_sizes)
+    box_h = padding_y * 2 + len(lines) * line_h + (len(lines) - 1) * line_gap
+    x1, y1 = 18, 18
+    x2, y2 = x1 + box_w, y1 + box_h
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (18, 22, 28), -1)
+    cv2.addWeighted(overlay, 0.58, frame, 0.42, 0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 95, 110), 1)
+
+    y = y1 + padding_y + line_h
+    for index, line in enumerate(lines):
+        color = (235, 240, 245) if index == 0 else (190, 205, 215)
+        cv2.putText(frame, line, (x1 + padding_x, y), font, scale, color, thickness, cv2.LINE_AA)
+        y += line_h + line_gap
 
 
 def should_drop_draw_item(
@@ -1958,6 +2090,8 @@ def run_realtime(args: argparse.Namespace) -> int:
             should_process = source_frame_index % args.process_every_n_frames == 0
             live_bboxes: list[tuple[int, int, int, int]] = []
             live_person_ids: set[str] = set()
+            for item in draw_buffer.values():
+                item.is_live = False
             if should_process:
                 if args.detector_backend == "rfdetr":
                     people = detect_people_rfdetr(
@@ -2012,12 +2146,23 @@ def run_realtime(args: argparse.Namespace) -> int:
                     drawn = args.draw_tentative or profile.status == "confirmed"
                     debug_logger.log_match(source_frame_index, observation, profile, breakdown, is_new, drawn)
                     if drawn:
+                        previous_item = draw_buffer.get(profile.person_id)
+                        smoothed_bbox = smooth_bbox(
+                            previous_item.draw_bbox if previous_item is not None else None,
+                            observation.bbox,
+                        )
+                        trail = list(previous_item.trail) if previous_item is not None else []
+                        trail.append(bbox_int_center(smoothed_bbox))
+                        trail = trail[-args.trail_length :]
                         draw_buffer[profile.person_id] = DrawItem(
                             observation=observation,
                             person_id=profile.person_id,
                             breakdown=breakdown,
                             is_new=is_new,
                             last_seen_frame=source_frame_index,
+                            draw_bbox=smoothed_bbox,
+                            is_live=True,
+                            trail=trail,
                         )
 
             expired_person_ids = [
@@ -2037,7 +2182,12 @@ def run_realtime(args: argparse.Namespace) -> int:
                 draw_buffer.pop(person_id, None)
 
             for item in draw_buffer.values():
-                draw_person(frame, item.observation, item.person_id, item.breakdown, item.is_new)
+                draw_person(frame, item)
+
+            if args.demo_hud:
+                live_draw_count = sum(1 for item in draw_buffer.values() if item.is_live)
+                held_draw_count = len(draw_buffer) - live_draw_count
+                draw_demo_hud(frame, args.camera_id, live_draw_count, held_draw_count, len(list(memory.profiles)))
 
             frame_count += 1
             source_frame_index += 1
@@ -2234,6 +2384,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.65,
         help="Drop a held missing box when this fraction of the smaller box overlaps a live detection.",
+    )
+    parser.add_argument(
+        "--trail-length",
+        type=non_negative_int,
+        default=16,
+        help="Number of recent center points drawn as a subtle trajectory trail; 0 disables trails.",
+    )
+    parser.add_argument(
+        "--demo-hud",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draw a compact demo HUD with camera, live count, held count, and memory size.",
     )
     parser.add_argument(
         "--min-live-visual-quality",
