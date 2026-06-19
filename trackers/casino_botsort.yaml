@@ -1,0 +1,27 @@
+# BoT-SORT tuning for crowded fixed-camera casino footage.
+# Compared with Ultralytics defaults, this starts fewer weak tracks and keeps
+# confirmed tracks alive longer through short occlusions.
+
+tracker_type: botsort
+
+# Require stronger detections for first-stage matching and new tracks.
+track_high_thresh: 0.35
+track_low_thresh: 0.12
+new_track_thresh: 0.45
+
+# Keep lost tracks during brief occlusions/crossings.
+track_buffer: 45
+
+# Slightly stricter association than default to reduce ID switches.
+match_thresh: 0.82
+fuse_score: True
+
+# Fixed surveillance cameras usually do not need global motion compensation.
+gmc_method: none
+
+# BoT-SORT ReID inside Ultralytics is disabled. This app handles Person ID ReID
+# separately with face/body/memory matching.
+proximity_thresh: 0.55
+appearance_thresh: 0.85
+with_reid: False
+model: auto

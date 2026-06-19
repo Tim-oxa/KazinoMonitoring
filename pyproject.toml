@@ -1,0 +1,22 @@
+[project]
+name = "kazinomonitoring"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "gdown>=6.1.0",
+    "insightface>=1.0.1",
+    "lap>=0.5.13",
+    "numpy>=2.4.6",
+    "onnxruntime>=1.27.0",
+    "opencv-python>=4.13.0.92",
+    "scikit-learn>=1.9.0",
+    "tensorboard>=2.20.0",
+    "torch>=2.12.1",
+    "torchreid>=0.2.5",
+    "ultralytics>=8.4.71",
+]
+
+[project.scripts]
+kazinomonitoring = "main:main"
